@@ -1,4 +1,4 @@
-"""Booking creation/listing with server-side validation."""
+"""Booking creation, guest booking list, and cancellation logic."""
 from datetime import date
 
 from fastapi import HTTPException
@@ -7,13 +7,14 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.db_schema.booking import Booking, BookingStatus
 from app.db_schema.listing import Listing
+from app.services import listings as listings_svc
+from app.services.pricing import build_quote
 from app.models.booking import BookingCreate
-from app.services import listings as listings_crud
-from app.services.pricing import compute_quote, nights_between
 
 
-def create_booking(db: Session, payload: BookingCreate) -> Booking:
-    listing = db.get(Listing, payload.listing_id)
+def make_booking(db: Session, payload: BookingCreate) -> Booking:
+    """Validate the request and persist a new confirmed booking."""
+    listing = listings_svc.find_listing(db, payload.listing_id)
     if not listing:
         raise HTTPException(status_code=404, detail="Listing not found")
 
@@ -24,10 +25,10 @@ def create_booking(db: Session, payload: BookingCreate) -> Booking:
             status_code=400,
             detail=f"This place allows a maximum of {listing.max_guests} guests",
         )
-    if listings_crud.has_overlap(db, listing.id, payload.check_in, payload.check_out):
+    if listings_svc.dates_are_taken(db, listing.id, payload.check_in, payload.check_out):
         raise HTTPException(status_code=409, detail="Selected dates are no longer available")
 
-    quote = compute_quote(listing.price_per_night, payload.check_in, payload.check_out)
+    quote = build_quote(listing.price_per_night, payload.check_in, payload.check_out)
     booking = Booking(
         listing_id=listing.id,
         guest_id=payload.guest_id,
@@ -47,22 +48,22 @@ def create_booking(db: Session, payload: BookingCreate) -> Booking:
     return booking
 
 
-def _with_listing_opts():
+def _booking_load_opts():
     return (selectinload(Booking.listing).selectinload(Listing.images),)
 
 
-def list_guest_bookings(db: Session, guest_id: int) -> list[Booking]:
+def get_guest_bookings(db: Session, guest_id: int) -> list[Booking]:
     stmt = (
         select(Booking)
         .where(Booking.guest_id == guest_id)
-        .options(*_with_listing_opts())
+        .options(*_booking_load_opts())
         .order_by(Booking.check_in.desc())
     )
     return list(db.execute(stmt).unique().scalars().all())
 
 
-def get_booking(db: Session, booking_id: int) -> Booking | None:
-    stmt = select(Booking).where(Booking.id == booking_id).options(*_with_listing_opts())
+def get_single_booking(db: Session, booking_id: int) -> Booking | None:
+    stmt = select(Booking).where(Booking.id == booking_id).options(*_booking_load_opts())
     return db.execute(stmt).unique().scalar_one_or_none()
 
 
@@ -73,8 +74,8 @@ def cancel_booking(db: Session, booking: Booking) -> Booking:
     return booking
 
 
-def list_host_bookings(db: Session, host_id: int) -> list[Booking]:
-    """All bookings across every listing owned by this host."""
+def get_host_bookings(db: Session, host_id: int) -> list[Booking]:
+    """Fetch all bookings across every listing owned by this host."""
     stmt = (
         select(Booking)
         .join(Listing, Booking.listing_id == Listing.id)

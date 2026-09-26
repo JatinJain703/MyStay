@@ -7,7 +7,7 @@ from app.db import get_db
 from app.db_schema.listing import Listing
 from app.models.listing import ListingCard
 from app.models.booking import BookingWithGuest
-from app.services import bookings as bookings_crud
+from app.services import bookings as bookings_svc
 
 router = APIRouter(prefix="/api/host", tags=["host"])
 
@@ -25,4 +25,4 @@ def host_listings(host_id: int, db: Session = Depends(get_db)):
 
 @router.get("/{host_id}/bookings", response_model=list[BookingWithGuest])
 def host_bookings(host_id: int, db: Session = Depends(get_db)):
-    return bookings_crud.list_host_bookings(db, host_id)
+    return bookings_svc.get_host_bookings(db, host_id)

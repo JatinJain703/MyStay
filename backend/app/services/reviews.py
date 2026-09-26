@@ -1,4 +1,4 @@
-"""Review creation with rating-aggregate recomputation."""
+"""Review creation and per-listing rating aggregate recalculation."""
 from datetime import date
 
 from sqlalchemy import select, func, and_, exists
@@ -10,12 +10,8 @@ from app.db_schema.booking import Booking, BookingStatus
 from app.models.review import ReviewCreate
 
 
-def has_completed_stay(db: Session, listing_id: int, user_id: int) -> bool:
-    """True if the user has a non-cancelled booking for this listing that has ended.
-
-    We treat any past-checkout, non-cancelled booking as a completed stay rather
-    than relying solely on the `completed` status flag (which isn't auto-updated).
-    """
+def user_stayed_here(db: Session, listing_id: int, user_id: int) -> bool:
+    """Returns True when the user has a past non-cancelled booking for this listing."""
     stmt = select(
         exists().where(
             and_(
@@ -29,7 +25,7 @@ def has_completed_stay(db: Session, listing_id: int, user_id: int) -> bool:
     return bool(db.execute(stmt).scalar())
 
 
-def list_for_listing(db: Session, listing_id: int) -> list[Review]:
+def get_listing_reviews(db: Session, listing_id: int) -> list[Review]:
     stmt = (
         select(Review)
         .where(Review.listing_id == listing_id)
@@ -39,7 +35,8 @@ def list_for_listing(db: Session, listing_id: int) -> list[Review]:
     return list(db.execute(stmt).scalars().all())
 
 
-def _recompute_aggregates(db: Session, listing_id: int) -> None:
+def _refresh_rating_stats(db: Session, listing_id: int) -> None:
+    """Recompute avg_rating and review_count on the listing row after any review change."""
     avg, count = db.execute(
         select(func.avg(Review.rating), func.count(Review.id)).where(Review.listing_id == listing_id)
     ).one()
@@ -48,9 +45,8 @@ def _recompute_aggregates(db: Session, listing_id: int) -> None:
     listing.review_count = int(count)
 
 
-def create_review(db: Session, listing_id: int, payload: ReviewCreate) -> Review:
-    # Upsert: one review per author per listing. If they've reviewed before,
-    # editing simply updates their existing review (avoids a unique-constraint error).
+def save_review(db: Session, listing_id: int, payload: ReviewCreate) -> Review:
+    """Upsert a review — one per author per listing. Updates if it already exists."""
     review = db.execute(
         select(Review).where(
             Review.listing_id == listing_id, Review.author_id == payload.author_id
@@ -61,14 +57,17 @@ def create_review(db: Session, listing_id: int, payload: ReviewCreate) -> Review
         review.rating = payload.rating
         review.comment = payload.comment
     else:
-        review = Review(listing_id=listing_id, author_id=payload.author_id,
-                        rating=payload.rating, comment=payload.comment)
+        review = Review(
+            listing_id=listing_id,
+            author_id=payload.author_id,
+            rating=payload.rating,
+            comment=payload.comment,
+        )
         db.add(review)
 
-    db.flush()  # persist before recomputing so the change is counted
-    _recompute_aggregates(db, listing_id)
+    db.flush()
+    _refresh_rating_stats(db, listing_id)
     db.commit()
     db.refresh(review)
-    # ensure author is loaded for the response
     db.refresh(review, attribute_names=["author"])
     return review

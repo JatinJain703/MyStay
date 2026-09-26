@@ -1,4 +1,4 @@
-"""Listing queries: search/filter/sort/paginate + CRUD + availability."""
+"""Handles all listing queries: browsing, filtering, sorting, pagination, CRUD, and date availability."""
 from datetime import date
 
 from sqlalchemy import select, func, and_, or_, exists
@@ -10,10 +10,10 @@ from app.db_schema.review import Review
 from app.models.listing import ListingCreate, ListingUpdate
 
 
-# ---- helpers ---------------------------------------------------------------
+# ---- internal helpers -------------------------------------------------------
 
-def _detail_options():
-    """Eager-load everything the detail page needs in one round trip."""
+def _full_load_opts():
+    """Returns selectinload options to fetch all related data needed for the detail view."""
     return (
         selectinload(Listing.images),
         selectinload(Listing.amenities),
@@ -22,8 +22,8 @@ def _detail_options():
     )
 
 
-def _overlap_condition(check_in: date, check_out: date):
-    """A confirmed booking conflicts if it starts before our end AND ends after our start."""
+def _dates_conflict(check_in: date, check_out: date):
+    """Booking conflicts when it starts before the requested checkout and ends after the requested checkin."""
     return and_(
         Booking.status == BookingStatus.confirmed,
         Booking.check_in < check_out,
@@ -31,14 +31,14 @@ def _overlap_condition(check_in: date, check_out: date):
     )
 
 
-# ---- read ------------------------------------------------------------------
+# ---- read -------------------------------------------------------------------
 
-def get_listing(db: Session, listing_id: int) -> Listing | None:
-    stmt = select(Listing).where(Listing.id == listing_id).options(*_detail_options())
+def find_listing(db: Session, listing_id: int) -> Listing | None:
+    stmt = select(Listing).where(Listing.id == listing_id).options(*_full_load_opts())
     return db.execute(stmt).unique().scalar_one_or_none()
 
 
-def search_listings(
+def fetch_listings(
     db: Session,
     *,
     location: str | None = None,
@@ -58,8 +58,8 @@ def search_listings(
     stmt = select(Listing)
 
     if location:
-        like = f"%{location}%"
-        stmt = stmt.where(or_(Listing.city.ilike(like), Listing.country.ilike(like)))
+        pattern = f"%{location}%"
+        stmt = stmt.where(or_(Listing.city.ilike(pattern), Listing.country.ilike(pattern)))
     if guests:
         stmt = stmt.where(Listing.max_guests >= guests)
     if min_price is not None:
@@ -73,7 +73,7 @@ def search_listings(
     if min_rating is not None:
         stmt = stmt.where(Listing.avg_rating >= min_rating)
 
-    # Every requested amenity must be present (AND semantics).
+    # All requested amenities must be present (AND logic).
     if amenity_ids:
         for aid in amenity_ids:
             stmt = stmt.where(
@@ -85,23 +85,23 @@ def search_listings(
                 )
             )
 
-    # Exclude listings with a confirmed booking overlapping the requested range.
+    # Filter out listings that have a confirmed booking overlapping requested dates.
     if check_in and check_out:
         conflict = exists().where(
-            and_(Booking.listing_id == Listing.id, _overlap_condition(check_in, check_out))
+            and_(Booking.listing_id == Listing.id, _dates_conflict(check_in, check_out))
         )
         stmt = stmt.where(~conflict)
 
-    # Total before pagination.
+    # Count total results before applying pagination.
     total = db.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
 
-    sort_map = {
+    order_options = {
         "price_asc": Listing.price_per_night.asc(),
         "price_desc": Listing.price_per_night.desc(),
         "rating": Listing.avg_rating.desc(),
         "newest": Listing.created_at.desc(),
     }
-    stmt = stmt.order_by(sort_map.get(sort, Listing.id.asc()))
+    stmt = stmt.order_by(order_options.get(sort, Listing.id.asc()))
     stmt = stmt.offset((page - 1) * page_size).limit(page_size)
     stmt = stmt.options(selectinload(Listing.images))
 
@@ -109,7 +109,7 @@ def search_listings(
     return list(items), total
 
 
-def booked_ranges(db: Session, listing_id: int) -> list[Booking]:
+def get_blocked_ranges(db: Session, listing_id: int) -> list[Booking]:
     stmt = (
         select(Booking)
         .where(Booking.listing_id == listing_id, Booking.status == BookingStatus.confirmed)
@@ -118,22 +118,22 @@ def booked_ranges(db: Session, listing_id: int) -> list[Booking]:
     return list(db.execute(stmt).scalars().all())
 
 
-def has_overlap(db: Session, listing_id: int, check_in: date, check_out: date) -> bool:
+def dates_are_taken(db: Session, listing_id: int, check_in: date, check_out: date) -> bool:
     stmt = select(
-        exists().where(and_(Booking.listing_id == listing_id, _overlap_condition(check_in, check_out)))
+        exists().where(and_(Booking.listing_id == listing_id, _dates_conflict(check_in, check_out)))
     )
     return bool(db.execute(stmt).scalar())
 
 
-# ---- write -----------------------------------------------------------------
+# ---- write ------------------------------------------------------------------
 
-def _apply_images(db: Session, listing: Listing, urls: list[str]):
+def _set_images(db: Session, listing: Listing, urls: list[str]):
     listing.images.clear()
-    for i, url in enumerate(urls):
-        listing.images.append(ListingImage(url=url, position=i))
+    for position, url in enumerate(urls):
+        listing.images.append(ListingImage(url=url, position=position))
 
 
-def _apply_amenities(db: Session, listing: Listing, amenity_ids: list[int]):
+def _set_amenities(db: Session, listing: Listing, amenity_ids: list[int]):
     amenities = db.execute(select(Amenity).where(Amenity.id.in_(amenity_ids))).scalars().all()
     listing.amenities = list(amenities)
 
@@ -141,11 +141,11 @@ def _apply_amenities(db: Session, listing: Listing, amenity_ids: list[int]):
 def create_listing(db: Session, payload: ListingCreate) -> Listing:
     data = payload.model_dump(exclude={"image_urls", "amenity_ids"})
     listing = Listing(**data)
-    _apply_images(db, listing, payload.image_urls)
-    _apply_amenities(db, listing, payload.amenity_ids)
+    _set_images(db, listing, payload.image_urls)
+    _set_amenities(db, listing, payload.amenity_ids)
     db.add(listing)
     db.commit()
-    return get_listing(db, listing.id)
+    return find_listing(db, listing.id)
 
 
 def update_listing(db: Session, listing: Listing, payload: ListingUpdate) -> Listing:
@@ -153,13 +153,13 @@ def update_listing(db: Session, listing: Listing, payload: ListingUpdate) -> Lis
     for field, value in data.items():
         setattr(listing, field, value)
     if payload.image_urls is not None:
-        _apply_images(db, listing, payload.image_urls)
+        _set_images(db, listing, payload.image_urls)
     if payload.amenity_ids is not None:
-        _apply_amenities(db, listing, payload.amenity_ids)
+        _set_amenities(db, listing, payload.amenity_ids)
     db.commit()
-    return get_listing(db, listing.id)
+    return find_listing(db, listing.id)
 
 
-def delete_listing(db: Session, listing: Listing) -> None:
+def remove_listing(db: Session, listing: Listing) -> None:
     db.delete(listing)
     db.commit()

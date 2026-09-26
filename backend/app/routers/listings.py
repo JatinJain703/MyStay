@@ -1,4 +1,4 @@
-"""Listing browse/search + host CRUD + availability + reviews sub-resource."""
+"""Listing browse/search, host CRUD, availability, reviews, and price quote endpoints."""
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -16,9 +16,9 @@ from app.models.listing import (
 )
 from app.models.booking import PriceQuote
 from app.models.review import ReviewOut, ReviewCreate
-from app.services import listings as crud
-from app.services import reviews as reviews_crud
-from app.services.pricing import compute_quote
+from app.services import listings as listings_svc
+from app.services import reviews as reviews_svc
+from app.services.pricing import build_quote
 
 router = APIRouter(prefix="/api", tags=["listings"])
 
@@ -41,7 +41,7 @@ def search_listings(
     page_size: int = Query(default=12, ge=1, le=48),
 ):
     amenity_ids = [int(a) for a in amenities.split(",") if a.strip().isdigit()] if amenities else None
-    items, total = crud.search_listings(
+    items, total = listings_svc.fetch_listings(
         db, location=location, check_in=check_in, check_out=check_out, guests=guests,
         min_price=min_price, max_price=max_price, property_type=property_type,
         room_type=room_type, amenity_ids=amenity_ids, min_rating=min_rating,
@@ -64,7 +64,7 @@ def amenities(db: Session = Depends(get_db)):
 
 @router.get("/listings/{listing_id}", response_model=ListingDetail)
 def get_listing(listing_id: int, db: Session = Depends(get_db)):
-    listing = crud.get_listing(db, listing_id)
+    listing = listings_svc.find_listing(db, listing_id)
     if not listing:
         raise HTTPException(status_code=404, detail="Listing not found")
     return listing
@@ -74,38 +74,37 @@ def get_listing(listing_id: int, db: Session = Depends(get_db)):
 def availability(listing_id: int, db: Session = Depends(get_db)):
     if not db.get(Listing, listing_id):
         raise HTTPException(status_code=404, detail="Listing not found")
-    ranges = [DateRange(check_in=b.check_in, check_out=b.check_out) for b in crud.booked_ranges(db, listing_id)]
+    ranges = [DateRange(check_in=b.check_in, check_out=b.check_out) for b in listings_svc.get_blocked_ranges(db, listing_id)]
     return AvailabilityOut(listing_id=listing_id, booked_ranges=ranges)
 
 
 @router.get("/listings/{listing_id}/quote", response_model=PriceQuote)
-def quote(listing_id: int, check_in: date, check_out: date, db: Session = Depends(get_db)):
+def price_quote(listing_id: int, check_in: date, check_out: date, db: Session = Depends(get_db)):
     listing = db.get(Listing, listing_id)
     if not listing:
         raise HTTPException(status_code=404, detail="Listing not found")
     if check_out <= check_in:
         raise HTTPException(status_code=400, detail="check_out must be after check_in")
-    return compute_quote(listing.price_per_night, check_in, check_out)
+    return build_quote(listing.price_per_night, check_in, check_out)
 
 
-# ---- Reviews sub-resource --------------------------------------------------
+# ---- Reviews ---------------------------------------------------------------
 
 @router.get("/listings/{listing_id}/reviews", response_model=list[ReviewOut])
 def list_reviews(listing_id: int, db: Session = Depends(get_db)):
-    return reviews_crud.list_for_listing(db, listing_id)
+    return reviews_svc.get_listing_reviews(db, listing_id)
 
 
 @router.post("/listings/{listing_id}/reviews", response_model=ReviewOut, status_code=201)
 def create_review(listing_id: int, payload: ReviewCreate, db: Session = Depends(get_db)):
     if not db.get(Listing, listing_id):
         raise HTTPException(status_code=404, detail="Listing not found")
-    # Bonus requirement: only guests who have completed a stay may review.
-    if not reviews_crud.has_completed_stay(db, listing_id, payload.author_id):
+    if not reviews_svc.user_stayed_here(db, listing_id, payload.author_id):
         raise HTTPException(
             status_code=403,
             detail="You can only review a place after your stay is complete",
         )
-    return reviews_crud.create_review(db, listing_id, payload)
+    return reviews_svc.save_review(db, listing_id, payload)
 
 
 # ---- Host CRUD -------------------------------------------------------------
@@ -113,28 +112,27 @@ def create_review(listing_id: int, payload: ReviewCreate, db: Session = Depends(
 @router.post("/listings", response_model=ListingDetail, status_code=201)
 def create_listing(payload: ListingCreate, db: Session = Depends(get_db),
                    user: User = Depends(get_current_user)):
-    # The creator is always the owner, regardless of payload host_id.
     payload.host_id = user.id
-    return crud.create_listing(db, payload)
+    return listings_svc.create_listing(db, payload)
 
 
 @router.put("/listings/{listing_id}", response_model=ListingDetail)
 def update_listing(listing_id: int, payload: ListingUpdate, db: Session = Depends(get_db),
                    user: User = Depends(get_current_user)):
-    listing = crud.get_listing(db, listing_id)
+    listing = listings_svc.find_listing(db, listing_id)
     if not listing:
         raise HTTPException(status_code=404, detail="Listing not found")
     if listing.host_id != user.id:
         raise HTTPException(status_code=403, detail="You can only edit your own listings")
-    return crud.update_listing(db, listing, payload)
+    return listings_svc.update_listing(db, listing, payload)
 
 
 @router.delete("/listings/{listing_id}", status_code=204)
 def delete_listing(listing_id: int, db: Session = Depends(get_db),
                    user: User = Depends(get_current_user)):
-    listing = crud.get_listing(db, listing_id)
+    listing = listings_svc.find_listing(db, listing_id)
     if not listing:
         raise HTTPException(status_code=404, detail="Listing not found")
     if listing.host_id != user.id:
         raise HTTPException(status_code=403, detail="You can only delete your own listings")
-    crud.delete_listing(db, listing)
+    listings_svc.remove_listing(db, listing)
