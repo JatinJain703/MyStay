@@ -12,7 +12,7 @@ from app.db_schema.listing import Listing, ListingImage, Amenity
 from app.db_schema.booking import Booking, BookingStatus
 from app.db_schema.review import Review
 from app.db_schema.wishlist import Wishlist
-from app.services.pricing import compute_quote
+from app.services.pricing import build_quote
 
 
 AMENITIES = [
@@ -206,7 +206,7 @@ def run():
             guest = guests[gi % len(guests)]
             check_in = today + timedelta(days=offset)
             check_out = check_in + timedelta(days=nights)
-            quote = compute_quote(listing.price_per_night, check_in, check_out)
+            quote = build_quote(listing.price_per_night, check_in, check_out)
             db.add(Booking(
                 listing_id=listing.id, guest_id=guest.id, check_in=check_in,
                 check_out=check_out, guests=min(2, listing.max_guests),
